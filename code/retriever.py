@@ -6,6 +6,7 @@ Index is built once at startup (~3–5s for 774 files) and reused.
 """
 
 import numpy as np
+import re
 from pathlib import Path
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -17,6 +18,84 @@ _DOMAIN_MAP = {
     "Claude":     "claude",
     "Visa":       "visa",
 }
+
+
+def _clean_title(path: Path) -> str:
+    return path.stem.replace("-", " ").replace("_", " ")
+
+
+def _iter_markdown_chunks(path: Path, content: str, max_chars: int = 2600):
+    """
+    Index article sections instead of only the first part of each article.
+    Support docs often hide the exact answer under a later heading, so section
+    retrieval gives the generator tighter evidence and less irrelevant context.
+    """
+    article_title = _clean_title(path)
+    lines = content.splitlines()
+    chunks: list[tuple[str, list[str]]] = []
+    current_title = article_title
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_lines
+        text = "\n".join(current_lines).strip()
+        if len(text) >= 40:
+            chunks.append((current_title, current_lines))
+        current_lines = []
+
+    for line in lines:
+        heading = re.match(r"^\s{0,3}(#{1,3})\s+(.+?)\s*$", line)
+        if heading and current_lines:
+            flush()
+            section = re.sub(r"\s+", " ", heading.group(2)).strip("# ").strip()
+            current_title = f"{article_title} :: {section}" if section else article_title
+        current_lines.append(line)
+
+        if sum(len(x) + 1 for x in current_lines) >= max_chars:
+            flush()
+
+    flush()
+
+    if not chunks and len(content.strip()) >= 40:
+        chunks.append((article_title, [content.strip()]))
+
+    for title, chunk_lines in chunks:
+        yield title, "\n".join(chunk_lines).strip()
+
+
+def _expand_query(query: str, company: str | None) -> str:
+    """
+    Lightweight domain synonym expansion.
+    This gives sparse retrieval a semantic-router feel without adding embeddings
+    or a vector DB: common support phrasing is mapped to the terms used in docs.
+    """
+    lo = query.lower()
+    company_lo = (company or "").lower()
+    additions: list[str] = []
+
+    if company_lo == "hackerrank" or "hackerrank" in lo:
+        if any(w in lo for w in ("employee", "interviewer", "user", "member")) and any(w in lo for w in ("remove", "delete", "left", "leaving")):
+            additions.append("teams management user management company admin team member invite user roles")
+        if any(w in lo for w in ("reschedule", "missed", "alternative date")):
+            additions.append("reschedule interview invite participants interview details candidate recruiter")
+        if any(w in lo for w in ("zoom", "connectivity", "compatible", "compatibility")):
+            additions.append("zoom system compatibility browser allowlist audio video calls interviews")
+        if "apply tab" in lo or "practice" in lo:
+            additions.append("apply tab deprecated prepare tab coding challenges notification")
+
+    if company_lo == "visa" or "visa" in lo:
+        if any(w in lo for w in ("minimum", "maximum", "spend", "merchant")):
+            additions.append("merchant set maximum minimum limit using Visa card rules")
+        if any(w in lo for w in ("lost", "stolen", "blocked", "travel", "cash")):
+            additions.append("lost Visa card travel support global assistance emergency cash ATM locator")
+
+    if company_lo == "claude" or "claude" in lo:
+        if any(w in lo for w in ("lti", "canvas", "students", "professor")):
+            additions.append("Claude LTI Canvas Instructure developer key LMS administrator education")
+        if "bedrock" in lo:
+            additions.append("Amazon Bedrock AWS support account manager Claude models regions")
+
+    return " ".join([query, *additions]).strip()
 
 
 class CorpusRetriever:
@@ -41,12 +120,13 @@ class CorpusRetriever:
                     content = path.read_text(encoding="utf-8", errors="ignore").strip()
                     if len(content) < 40:
                         continue
-                    self.docs.append({
-                        "path":    str(path),
-                        "content": content[:8000],   # full article for indexing
-                        "domain":  domain,
-                        "title":   path.stem.replace("-", " ").replace("_", " "),
-                    })
+                    for title, chunk in _iter_markdown_chunks(path, content):
+                        self.docs.append({
+                            "path":    str(path),
+                            "content": chunk[:3000],
+                            "domain":  domain,
+                            "title":   title,
+                        })
                 except Exception:
                     pass
 
@@ -64,7 +144,8 @@ class CorpusRetriever:
             return []
 
         target_domain = _DOMAIN_MAP.get(company) if company else None
-        query_vec = self._vectorizer.transform([query[:1000]])
+        expanded_query = _expand_query(query[:1000], company)
+        query_vec = self._vectorizer.transform([expanded_query])
         scores = cosine_similarity(query_vec, self._matrix).flatten()
 
         if target_domain:
@@ -81,14 +162,14 @@ class CorpusRetriever:
             if scores[idx] < 0.02 or len(results) >= top_k:
                 break
             doc = self.docs[idx]
-            key = doc["title"]
+            key = (doc["path"], doc["title"])
             if key in seen:
                 continue
             seen.add(key)
             results.append({
                 "domain":  doc["domain"],
                 "title":   doc["title"],
-                "content": doc["content"][:1800],   # more context per doc for Claude
+                "content": doc["content"][:1800],
                 "score":   float(scores[idx]),
             })
 

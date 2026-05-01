@@ -82,6 +82,8 @@ Return ONLY a JSON object — no markdown fences, no extra text — with exactly
 GROUNDING RULE — every claim in your response MUST come from the corpus excerpts above.
 End every replied response with: "Source: [article title]" referencing the excerpt used.
 If a corpus excerpt covers the issue partially, use what is there and note any gaps.
+Use the retrieval quality notes as a confidence signal: when the top evidence is weak,
+off-domain, or only loosely related, prefer escalation over a speculative answer.
 
 ESCALATION — set status=escalated ONLY for:
   • Refund demands / billing disputes requiring human payment authorization
@@ -106,6 +108,49 @@ For replied tickets, cite only information from the corpus excerpts provided.\
 """
 
 
+def _model_candidates() -> list[str]:
+    configured = os.getenv("ANTHROPIC_MODEL") or os.getenv("CLAUDE_MODEL")
+    defaults = [
+        "claude-sonnet-4-20250514",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+    ]
+    if configured:
+        return [configured] + [m for m in defaults if m != configured]
+    return defaults
+
+
+def _retrieval_quality(company: str, docs: list[dict]) -> str:
+    if not docs:
+        return "no_evidence: no matching corpus sections were retrieved; escalate unless the ticket is clearly invalid/out-of-scope."
+
+    company_norm = (company or "").strip().lower()
+    domain_map = {"hackerrank": "hackerrank", "claude": "claude", "visa": "visa"}
+    expected_domain = domain_map.get(company_norm)
+    top = docs[0]
+    top_score = top.get("score", 0.0)
+    top_domain = top.get("domain", "unknown")
+    domain_note = "unknown_company"
+
+    if expected_domain:
+        domain_note = "on_domain" if top_domain == expected_domain else "off_domain"
+
+    if top_score >= 0.18:
+        confidence = "strong"
+    elif top_score >= 0.08:
+        confidence = "usable"
+    elif top_score >= 0.035:
+        confidence = "weak"
+    else:
+        confidence = "very_weak"
+
+    return (
+        f"top_score={top_score:.3f}; confidence={confidence}; "
+        f"domain_match={domain_note}; top_source={top_domain} / {top.get('title', 'unknown')}"
+    )
+
+
 def _build_user_message(issue: str, subject: str, company: str, docs: list[dict]) -> str:
     company_label = company if company and company.lower() != "none" else "Unknown (infer from content)"
 
@@ -122,6 +167,7 @@ def _build_user_message(issue: str, subject: str, company: str, docs: list[dict]
         f"Company : {company_label}\n"
         f"Subject : {subject or '(none)'}\n"
         f"Issue   : {issue}\n\n"
+        f"RETRIEVAL QUALITY\n{_retrieval_quality(company, docs)}\n\n"
         f"CORPUS EXCERPTS\n{excerpts}\n\n"
         f"Classify and respond using ONLY the corpus excerpts above."
     )
@@ -165,9 +211,7 @@ def triage(issue: str, subject: str, company: str) -> TriageResult:
     user_msg = _build_user_message(issue, subject, company, docs)
     client = _get_client()
 
-    # claude-sonnet-4-6 is the correct model ID for this environment.
-    # Fallback to claude-sonnet-4-5 if the alias is unrecognised.
-    for _model in ("claude-sonnet-4-6", "claude-sonnet-4-5"):
+    for _model in _model_candidates():
         try:
             response = client.messages.create(
                 model=_model,

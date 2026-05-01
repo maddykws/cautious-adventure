@@ -45,7 +45,7 @@ def run(input_path: Path, output_path: Path) -> None:
     retriever = get_retriever()
     elapsed = time.monotonic() - t0
     console.print(
-        f"[green]Indexed[/green] {len(retriever.docs)} documents "
+        f"[green]Indexed[/green] {len(retriever.docs)} corpus chunks "
         f"in {elapsed:.1f}s\n"
     )
 

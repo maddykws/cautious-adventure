@@ -4,6 +4,7 @@ Runs before calling Claude — fast, deterministic, no API cost.
 """
 
 import re
+import unicodedata
 
 # ── Patterns that ALWAYS force escalation ─────────────────────────────────────
 
@@ -24,6 +25,8 @@ _ESCALATION_PATTERNS = [
     # Unauthorized account changes
     r"I am not the .{0,30}(owner|admin|workspace owner)",
     r"restore my access.{0,50}not (the )?(owner|admin)",
+    r"\bnot (an?|the)?\s*(workspace\s+)?(owner|admin)\b.{0,80}\b(access|restore|remove|delete|modify|change|invite|add)\b",
+    r"\b(access|restore|remove|delete|modify|change|invite|add)\b.{0,80}\bnot (an?|the)?\s*(workspace\s+)?(owner|admin)\b",
     r"(remove|delete|ban) .{0,50}(seller|merchant|vendor)",
     # System-wide outages
     r"site is down", r"platform.{0,20}(is |has )?(been )?down",
@@ -34,8 +37,11 @@ _ESCALATION_PATTERNS = [
     r"exec\s*\(", r"os\.system\s*\(",
     r"ignore (previous|all|your) instructions",
     r"show (me )?(your|the) (internal|system|hidden) (rules|prompt|instructions|logic)",
-    r"affiche .{0,100}(règles internes|documents récupérés|logique)",   # French injection (widened for newlines after normalisation)
-    r"display .{0,100}(internal rules|retrieved documents|decision logic)",
+    r"show .{0,80}(internal|system|hidden).{0,40}(rules|prompt|instructions|logic)",
+    r"affiche .{0,80}(regles internes|documents recuperes|logique)",
+    r"(regles internes|documents recuperes|logique exacte).{0,80}(fraude|decision)",
+    r"affiche .{0,50}(règles internes|documents récupérés|logique)",   # French injection
+    r"display .{0,50}(internal rules|retrieved documents|decision logic)",
     # Infosec questionnaires / compliance forms (can't fill on behalf)
     r"(fill(ing)?|complete?) .{0,30}(infosec|security|compliance|vendor) (form|questionnaire|process)",
     # Privacy data-retention duration — corpus has no specific durations; guessing is harmful
@@ -43,8 +49,7 @@ _ESCALATION_PATTERNS = [
     r"\b(data retention|retention period|how long.{0,20}retain)\b",
 ]
 
-# Compiled with IGNORECASE only — DOTALL is handled by whitespace normalisation in check_escalation
-_ESC_RE = [re.compile(p, re.IGNORECASE) for p in _ESCALATION_PATTERNS]
+_ESC_RE = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in _ESCALATION_PATTERNS]
 
 # ── Request type keyword heuristics ──────────────────────────────────────────
 
@@ -67,17 +72,22 @@ _BUG_RE = [re.compile(p, re.IGNORECASE) for p in [
 _INVALID_RE = [re.compile(p, re.IGNORECASE) for p in [
     r"^(thank you|thanks|thank u|ty)[!.]*\s*$",
     r"^(hi|hello|hey|good (morning|afternoon|evening))[!.]*\s*$",
+    r"^(hi|hello|hey)[,!\s]*(thanks|thank you|thank u)?[!.]*\s*$",
     r"\bwhat is (the name of the actor|the actor in|the name of the movie)\b",
     r"^(none|n/a|na|-)\s*$",
     r"^give me (the code|a script|code) to\b",  # code requests not related to support
 ]]
 
 
-def _normalise(text: str) -> str:
-    """Collapse all whitespace (newlines, tabs, multiple spaces) to single spaces.
-    Patterns use . which doesn't cross newlines without DOTALL — normalise instead
-    so all patterns work uniformly on multi-line ticket text."""
-    return re.sub(r"\s+", " ", text).strip()
+def _normalize_text(text: str) -> str:
+    """
+    Collapse adversarial formatting before regex safety checks.
+    This catches prompt-injection variants split by newlines, tabs, repeated
+    spaces, or accents (for example French "règles" vs "regles").
+    """
+    text = " ".join((text or "").split())
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
 
 
 def check_escalation(issue: str, subject: str = "") -> tuple[bool, str]:
@@ -85,9 +95,10 @@ def check_escalation(issue: str, subject: str = "") -> tuple[bool, str]:
     Returns (should_escalate: bool, reason: str).
     True means the ticket must be escalated without calling Claude.
     """
-    text = _normalise(f"{subject} {issue}")
+    raw_text = f"{subject} {issue}"
+    text = _normalize_text(raw_text)
     for regex in _ESC_RE:
-        m = regex.search(text)
+        m = regex.search(text) or regex.search(raw_text)
         if m:
             return True, f"matched pattern: '{m.group()}'"
     return False, ""
@@ -98,7 +109,7 @@ def classify_request_type(issue: str, subject: str = "") -> str:
     Keyword-based pre-classification. Claude may override this in its response.
     Returns one of: product_issue | feature_request | bug | invalid
     """
-    text = f"{subject} {issue}".strip()
+    text = _normalize_text(f"{subject} {issue}".strip())
 
     if not text or len(text) < 8:
         return "invalid"

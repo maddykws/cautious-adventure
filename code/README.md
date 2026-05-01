@@ -9,7 +9,7 @@ support_tickets.csv
        |
   [classifier.py]        — rule-based safety/escalation gate (no API call)
        |
-  [retriever.py]         — TF-IDF search over 774 corpus .md files
+  [retriever.py]         — section-level TF-IDF search over corpus .md files
        |
   [Claude sonnet-4-6]    — structured JSON response grounded in corpus
        |
@@ -17,8 +17,10 @@ support_tickets.csv
 ```
 
 **Key design decisions:**
-- **TF-IDF retrieval** over all 774 `.md` files (HackerRank: 438, Claude: 322, Visa: 14). Built once at startup, reused for all tickets.
-- **Rule-based safety gate** runs before any API call. Catches fraud, score manipulation, adversarial prompts, system outages, and prompt-injection attacks deterministically.
+- **Section-level TF-IDF retrieval** over the provided `.md` corpus. Articles are split by headings so later sections (for example Visa minimum-spend rules or HackerRank team-member removal) can be retrieved directly instead of relying only on the beginning of a page.
+- **Domain synonym expansion** maps user phrasing to documentation terms (for example "employee left" -> "Teams Management", "minimum spend" -> "merchant minimum limit").
+- **Rule-based safety gate** runs before any API call. It normalizes whitespace and accents so multilingual/newline prompt-injection attacks are caught deterministically.
+- **Retrieval quality notes** are passed to Claude so weak or off-domain evidence is treated as a signal to escalate rather than guess.
 - **Corpus-grounded responses** — Claude is instructed to use only retrieved excerpts. No hallucinated policies.
 - **Domain boosting** — docs from the ticket's company get a 1.5× relevance boost; other domains get 0.7× (cross-domain still searchable for `company=None`).
 - **Fallback escalation** — if Claude's response cannot be parsed or an error occurs, the ticket is escalated (safe default).
@@ -72,4 +74,7 @@ Tickets are **always escalated** (no Claude call) if they match:
 ```bash
 # Quick smoke test against sample tickets:
 python code/main.py --input support_tickets/sample_support_tickets.csv --output /tmp/sample_out.csv
+
+# Deterministic guardrail/retrieval/schema tests (no API call):
+python code/smoke_tests.py
 ```
