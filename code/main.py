@@ -34,7 +34,7 @@ AUDIT_JSONL = REPO_ROOT / "support_tickets" / "evidence_audit.jsonl"
 OUTPUT_FIELDS = [
     "issue", "subject", "company",
     "response", "product_area", "status", "request_type",
-    "retrieval_score", "multi_intent", "justification",
+    "justification",
 ]
 
 
@@ -230,8 +230,6 @@ def run(input_path: Path, output_path: Path, audit_path: Path) -> None:
                     "product_area":    result.product_area,
                     "status":          result.status,
                     "request_type":    result.request_type,
-                    "retrieval_score": f"{result.retrieval_score:.3f}",
-                    "multi_intent":    str(result.multi_intent).lower(),
                     "justification":   result.justification,
                 })
                 audit_entries.append(entry.to_dict())
