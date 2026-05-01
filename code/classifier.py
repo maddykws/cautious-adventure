@@ -34,12 +34,16 @@ _ESCALATION_PATTERNS = [
     r"exec\s*\(", r"os\.system\s*\(",
     r"ignore (previous|all|your) instructions",
     r"show (me )?(your|the) (internal|system|hidden) (rules|prompt|instructions|logic)",
-    r"affiche .{0,50}(règles internes|documents récupérés|logique)",   # French injection
-    r"display .{0,50}(internal rules|retrieved documents|decision logic)",
+    r"affiche .{0,100}(règles internes|documents récupérés|logique)",   # French injection (widened for newlines after normalisation)
+    r"display .{0,100}(internal rules|retrieved documents|decision logic)",
     # Infosec questionnaires / compliance forms (can't fill on behalf)
     r"(fill(ing)?|complete?) .{0,30}(infosec|security|compliance|vendor) (form|questionnaire|process)",
+    # Privacy data-retention duration — corpus has no specific durations; guessing is harmful
+    r"how long (will|is|does|do).{0,50}(data|information).{0,30}(used|kept|retained|stored)",
+    r"\b(data retention|retention period|how long.{0,20}retain)\b",
 ]
 
+# Compiled with IGNORECASE only — DOTALL is handled by whitespace normalisation in check_escalation
 _ESC_RE = [re.compile(p, re.IGNORECASE) for p in _ESCALATION_PATTERNS]
 
 # ── Request type keyword heuristics ──────────────────────────────────────────
@@ -69,12 +73,19 @@ _INVALID_RE = [re.compile(p, re.IGNORECASE) for p in [
 ]]
 
 
+def _normalise(text: str) -> str:
+    """Collapse all whitespace (newlines, tabs, multiple spaces) to single spaces.
+    Patterns use . which doesn't cross newlines without DOTALL — normalise instead
+    so all patterns work uniformly on multi-line ticket text."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def check_escalation(issue: str, subject: str = "") -> tuple[bool, str]:
     """
     Returns (should_escalate: bool, reason: str).
     True means the ticket must be escalated without calling Claude.
     """
-    text = f"{subject} {issue}"
+    text = _normalise(f"{subject} {issue}")
     for regex in _ESC_RE:
         m = regex.search(text)
         if m:
