@@ -1,10 +1,19 @@
-# HackerRank Orchestrate
+# HackerRank Orchestrate — Support Triage Agent
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon (May 1–2, 2026).
+Submission for the **HackerRank Orchestrate** 24-hour hackathon (May 1–2, 2026).
 
-Build a terminal-based AI agent that triages real support tickets across three product ecosystems; **HackerRank**, **Claude**, and **Visa** — using only the support corpus shipped in this repo.
+A terminal-based AI agent that triages real support tickets across three product ecosystems — **HackerRank**, **Claude**, **Visa** — using only the support corpus shipped in this repo.
 
-Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, and allowed values, and [`evalutation_criteria.md`](./evalutation_criteria.md) for how submissions are scored.
+| Run profile | Total | Replied | Escalated | Errors |
+|---|---:|---:|---:|---:|
+| 29 tickets, `temperature=0`, hybrid retrieval, 4-iter agent loop | 29 | 14 | 15 | 0 |
+
+**Quick links:**
+- [`code/README.md`](./code/README.md) — architecture, setup, run instructions
+- [`DECISION_POLICY.md`](./DECISION_POLICY.md) — the policy the agent enforces (safety gate, reply-vs-escalate, partial-reply, justification template)
+- [`TICKET_AUDIT.md`](./TICKET_AUDIT.md) — per-ticket decision audit with one-line rationale for every row in `output.csv`
+- [`problem_statement.md`](./problem_statement.md) — task spec
+- [`evalutation_criteria.md`](./evalutation_criteria.md) — rubric
 
 ---
 

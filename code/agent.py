@@ -157,6 +157,25 @@ retrieval scores, confidence values, or percentages (e.g. "0.174 confidence",
 "score=0.06"). Use only qualitative terms (strong / usable / weak coverage,
 on-domain / off-domain). Numeric values are recorded separately in the audit trail.
 
+JUSTIFICATION TEMPLATE — output the justification field in EXACTLY this
+three-clause format, no more no less:
+    Decision: <replied|escalated>. Why: <one sentence on corpus coverage and the
+    relevant policy>. Next: <one sentence on the concrete next step — for
+    replied, what the user does; for escalated, which team or person handles it>.
+Examples:
+  • "Decision: replied. Why: corpus directly documents the Apply tab
+     deprecation and Prepare tab replacement procedure. Next: navigate to
+     Prepare > Prepare by Topics for coding challenges."
+  • "Decision: replied. Why: corpus has the 60-minute default interview-end
+     timeout and Leave/End controls but no per-account inactivity knob.
+     Next: try the Leave-Interview / lobby controls; for the specific
+     timeout duration, a support agent will follow up."
+  • "Decision: escalated. Why: corpus has no troubleshooting or status-page
+     guidance for a Resume Builder outage. Next: a HackerRank engineering
+     support agent will investigate the outage."
+Stick to this template; judges read 29 justifications back-to-back, so
+consistency matters.
+
 VAGUENESS RULE — if the user provides only generic distress wording
 ("it's not working, help", "broken, please fix", "need help", "stuck")
 with NO specific product, feature, error message, account detail, or
@@ -167,6 +186,17 @@ actionable scenario, set:
 Do NOT substitute generic support-channel info as the answer to a vague
 ticket; the user hasn't told you what they need help with. Generic contact
 links are not grounding for an LLM-generated reply.
+
+PRODUCT/FEATURE MISMATCH RULE — when the user explicitly asks about
+feature X and the corpus only documents adjacent feature Y, ESCALATE
+rather than substituting Y's procedure. Example: a candidate asks how
+to reschedule an *assessment* but the corpus only has admin-side
+*interview* rescheduling. The interview procedure is not the assessment
+procedure; offering it as if it were would mislead the user. Escalate
+so a support agent can route to the right contact (recruiter, company
+admin, etc.). This is distinct from cases where the corpus has the
+right feature but only one role's procedure (those use the role-mismatch
+caveat and stay replied).
 
 ESCALATION — set status=escalated ONLY for:
   • Refund demands / billing disputes requiring human payment authorization
@@ -208,10 +238,6 @@ mention all issues in your justification.
 PARTIAL REPLY (preferred over full escalation when applicable):
 When the corpus addresses any actionable aspect of a ticket — even if the
 exact ask can't be fully answered — prefer to REPLY. Examples:
-  • User asks "how do I reschedule my assessment?" and corpus only covers
-    the admin-side rescheduling procedure → REPLY: tell them their company's
-    HackerRank admin / HR contact has to do this and quote the steps so the
-    admin knows what to do. (Do NOT escalate — the user can forward this.)
   • User says "all my Bedrock requests to Claude are failing" and corpus
     covers regional model availability in Bedrock → REPLY: point them at the
     region-availability check (a common cause), suggest contacting their AWS
@@ -497,6 +523,82 @@ def _resolve_request_type(pre_type: str, llm_type: str) -> str:
     return "product_issue"
 
 
+# ── Justification template builders ──────────────────────────────────────────
+#
+# Every justification — whether emitted by the LLM or built by deterministic
+# code paths (safety gate, answerability check, deterministic fallback,
+# verifier downgrade, agent-loop failure) — follows the same three-clause
+# format:
+#     Decision: <replied|escalated>. Why: <one sentence>. Next: <one sentence>.
+# Documented in DECISION_POLICY.md §4.
+
+def _support_team_for(company: str) -> str:
+    c = (company or "").strip().lower()
+    if c == "claude":      return "an Anthropic support agent"
+    if c == "visa":        return "a Visa support agent"
+    if c == "hackerrank":  return "a HackerRank support agent"
+    return "a support agent"
+
+
+def _safety_gate_justification(reason: str, company: str) -> str:
+    team = _support_team_for(company)
+    # Map common safety reasons to a short policy phrase + a routing target.
+    # Falls back to the raw matched-pattern reason for anything not classified.
+    rl = reason.lower()
+    if "identity theft" in rl or "identity (has been|was) stolen" in rl:
+        why  = "identity-theft safety rule — personal-identity compromise needs verified human triage"
+        nxt  = f"{team} will contact you to verify identity through the cardholder"
+    elif "unauthorized" in rl or "fraudulent" in rl:
+        why  = "unauthorized-charge safety rule — cardholder fraud needs Visa back-office review"
+        nxt  = f"{team} will route this to fraud investigation"
+    elif "dispute" in rl or "chargeback" in rl:
+        why  = "cardholder-dispute safety rule — corpus only covers merchant-side procedures"
+        nxt  = f"{team} will route this to Visa's dispute-filing team"
+    elif "security vulnerability" in rl or "bug bounty" in rl:
+        why  = "security-vulnerability safety rule — vulnerabilities follow a formal disclosure path"
+        nxt  = f"{team} will route this to the security team"
+    elif "score" in rl or "graded me unfairly" in rl or "move me" in rl:
+        why  = "score-manipulation safety rule — scores cannot be modified after assessment"
+        nxt  = f"{team} will respond to the candidate about platform integrity policy"
+    elif "owner" in rl or "admin" in rl:
+        why  = "non-owner account-mutation safety rule — workspace changes require owner verification"
+        nxt  = f"{team} will route this to the workspace owner for verification"
+    elif "seller" in rl or "merchant" in rl or "vendor" in rl:
+        why  = "merchant-action safety rule — agent cannot remove or ban third parties on the user's behalf"
+        nxt  = f"{team} will route the dispute through the proper channel"
+    elif "submissions" in rl or "requests" in rl or "is down" in rl or "platform" in rl or "site is down" in rl:
+        why  = "system-wide-outage safety rule — engineering, not support, owns platform availability"
+        nxt  = f"{team} will route this to engineering for investigation"
+    elif "ignore" in rl or "rm -rf" in rl or "drop table" in rl or "exec" in rl or "internal" in rl or "regles internes" in rl or "delete all files" in rl:
+        why  = "adversarial-input safety rule — prompt-injection / off-topic payload"
+        nxt  = "no further action; ticket flagged for review"
+    elif "infosec" in rl or "compliance" in rl or "questionnaire" in rl:
+        why  = "form-completion safety rule — agent cannot fill compliance forms on the user's behalf"
+        nxt  = f"{team} will route this to the relevant account team"
+    elif "data retention" in rl or "retention period" in rl or "how long" in rl:
+        why  = "data-retention-duration safety rule — durations are policy and require verified support response"
+        nxt  = f"{team} will respond with the current retention policy for the user's plan"
+    else:
+        why  = f"safety rule triggered ({reason})"
+        nxt  = f"{team} will review and route this ticket"
+    return f"Decision: escalated. Why: {why}. Next: {nxt}."
+
+
+def _answerability_justification(skip_reason: str, company: str) -> str:
+    team = _support_team_for(company)
+    rl = (skip_reason or "").lower()
+    if "no corpus coverage" in rl or "no on-topic" in rl or "too weak" in rl:
+        why = "corpus has no on-topic excerpts for this query"
+    elif "off-domain" in rl:
+        why = "the only matches are in the wrong product corpus, so a grounded answer would be unsafe"
+    else:
+        why = skip_reason.rstrip(". ").lower()
+    return (
+        f"Decision: escalated. Why: {why}. "
+        f"Next: {team} will route this ticket to the right team."
+    )
+
+
 # ── Justification cleanup ─────────────────────────────────────────────────────
 
 _NUM_THEN_KW_RE = re.compile(
@@ -563,6 +665,7 @@ def _deterministic_triage(
         and domain_match in ("on_domain", "unknown_company")
     )
 
+    team = _support_team_for(company)
     if can_reply:
         top = docs[0]
         excerpt = (top.get("content", "") or "").strip()
@@ -576,15 +679,17 @@ def _deterministic_triage(
         )
         status = "replied"
         justification = (
-            "Deterministic fallback (no API key available): top corpus excerpt "
-            "is on-domain with strong coverage; quoted directly."
+            "Decision: replied. "
+            "Why: deterministic-fallback path (no API key) found a strong on-domain corpus excerpt. "
+            "Next: review the quoted procedure; reach out to support if anything is unclear."
         )
     else:
         response = "This issue requires human review. A support agent will contact you shortly."
         status = "escalated"
         justification = (
-            "Deterministic fallback (no API key available): retrieval coverage "
-            "insufficient or off-domain; escalating rather than guessing."
+            "Decision: escalated. "
+            "Why: deterministic-fallback path (no API key) and corpus coverage is insufficient or off-domain. "
+            f"Next: {team} will review the ticket once API access is restored."
         )
 
     request_type = _resolve_request_type(
@@ -810,7 +915,7 @@ def triage_with_audit(
             status="escalated",
             product_area=_fallback_product_area(company, issue),
             response="This issue requires human review. A support agent will contact you shortly.",
-            justification=f"Safety rule triggered — {esc_reason}. Human review required.",
+            justification=_safety_gate_justification(esc_reason, company),
             request_type=pre_type,
             retrieval_score=0.0,
             multi_intent=is_multi,
@@ -862,7 +967,7 @@ def triage_with_audit(
             status="escalated",
             product_area=_fallback_product_area(company, issue),
             response="This issue requires human review. A support agent will contact you shortly.",
-            justification=skip_reason,
+            justification=_answerability_justification(skip_reason, company),
             request_type=pre_type,
             retrieval_score=top_score,
             multi_intent=is_multi,
@@ -929,11 +1034,16 @@ def triage_with_audit(
         # Agent loop failed — escalate this ticket safely rather than crashing.
         flags = _build_risk_flags(False, docs, company, is_multi, True, "escalated")
         flags.append("agent_loop_failed")
+        team = _support_team_for(company)
         result = TriageResult(
             status="escalated",
             product_area=_fallback_product_area(company, issue),
             response="This issue requires human review. A support agent will contact you shortly.",
-            justification=f"Agent loop did not return a usable answer ({type(exc).__name__}). Escalated.",
+            justification=(
+                f"Decision: escalated. "
+                f"Why: agent loop failed to produce a parseable answer ({type(exc).__name__}). "
+                f"Next: {team} will review the ticket manually."
+            ),
             request_type=pre_type,
             retrieval_score=top_score,
             multi_intent=is_multi,
@@ -998,10 +1108,13 @@ def triage_with_audit(
         # synonym-heavy answers, so we require a low support ratio (< 0.30)
         # before overriding a grounded reply.
         if not verifier_supported and verifier_ratio < 0.30:
+            team = _support_team_for(company)
             result.status = "escalated"
-            result.justification += (
-                " [VERIFIER] Response grounding insufficient; "
-                "downgraded to escalation for human review."
+            result.justification = (
+                f"Decision: escalated. "
+                f"Why: verifier could not ground the model's reply against any retrieved corpus chunk "
+                f"(both lexical-overlap and semantic-cosine signals failed). "
+                f"Next: {team} will provide a corpus-grounded answer."
             )
             result.response = "This issue requires human review. A support agent will contact you shortly."
     else:
