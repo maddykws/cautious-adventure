@@ -93,6 +93,17 @@ def _expand_query(query: str, company: str | None) -> str:
             additions.append("certifications certificate name regenerate update")
         if any(w in lo for w in ("pause", "subscription", "billing", "plan")):
             additions.append("pause subscription billing plan monthly cancel manage")
+        if any(w in lo for w in ("inactivity", "inactive", "lobby", "kicked", "screen share", "timeout")):
+            additions.append(
+                "ending interview leave interview inactivity hour lobby candidate "
+                "interviewer no other interviewers present interview ends automatically"
+            )
+        if any(w in lo for w in ("infosec", "compliance", "vendor", "security review", "gdpr", "soc 2", "audit")):
+            additions.append(
+                "HackerRank for Work security GDPR account-level security NYC AI law "
+                "bias audit results plagiarism detection proctoring impersonation detection "
+                "compliance vendor questionnaire data privacy"
+            )
 
     if company_lo == "visa" or "visa" in lo:
         if any(w in lo for w in ("minimum", "maximum", "spend", "merchant", "limit")):
@@ -109,6 +120,12 @@ def _expand_query(query: str, company: str | None) -> str:
             additions.append("Amazon Bedrock AWS support account manager Claude models regions")
         if any(w in lo for w in ("crawl", "scrape", "robots", "bot", "website")):
             additions.append("Anthropic crawler robots.txt allowlist data scraping website")
+        if any(w in lo for w in ("data", "retention", "retained", "kept", "stored", "training", "improve", "model improvement")):
+            additions.append(
+                "Claude data retention default 30 days minimum custom retention controls "
+                "Enterprise plan Owner organization settings data privacy controls "
+                "model improvement training conversation data delete"
+            )
 
     return " ".join([query, *additions]).strip()
 

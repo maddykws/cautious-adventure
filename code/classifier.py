@@ -47,9 +47,13 @@ _ESCALATION_PATTERNS = [
     r"display .{0,50}(internal rules|retrieved documents|decision logic)",
     # Infosec questionnaires / compliance forms (can't fill on behalf)
     r"(fill(ing)?|complete?) .{0,30}(infosec|security|compliance|vendor) (form|questionnaire|process)",
-    # Privacy data-retention duration — corpus has no specific durations; guessing is harmful
-    r"how long (will|is|does|do).{0,50}(data|information).{0,30}(used|kept|retained|stored)",
-    r"\b(data retention|retention period|how long.{0,20}retain)\b",
+    # Privacy data-retention duration — escalate when the user is asking about
+    # how long data is *kept/retained/stored*. Cases asking how data is *used*
+    # (e.g. "how long will the data be used to improve models") are routed
+    # to the LLM because the Claude corpus has explicit retention controls
+    # docs (default 30 days, configurable for Enterprise).
+    r"how long (will|is|does|do).{0,50}(data|information).{0,30}(kept|retained|stored)",
+    r"\b(data retention period|retention period|how long.{0,20}retain)\b",
 ]
 
 _ESC_RE = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in _ESCALATION_PATTERNS]
