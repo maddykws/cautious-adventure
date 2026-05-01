@@ -8,12 +8,12 @@ import re
 # ── Patterns that ALWAYS force escalation ─────────────────────────────────────
 
 _ESCALATION_PATTERNS = [
-    # Financial fraud / stolen assets
-    r"\bfraud\b", r"\bidentity theft\b", r"\bstolen\b", r"\bfraudulent\b",
-    r"\bunauthorized (charge|transaction|access|debit|payment)\b",
-    # Card / cheque emergencies
-    r"\b(lost|stolen).*(card|cheque|wallet)\b",
-    r"\b(card|cheque).*(lost|stolen)\b",
+    # Identity theft — always human (lost/stolen CARD is corpus-answerable, identity theft is not)
+    r"\bidentity theft\b",
+    r"\bidentity (has been|was) stolen\b",
+    # Unauthorized financial activity (not the same as "my card was lost")
+    r"\bunauthorized (charge|transaction|debit|payment)\b",
+    r"\bfraudulent (charge|transaction|payment|activity)\b",
     # Security vulnerabilities
     r"\bsecurity vulnerability\b", r"\bbug bounty\b",
     r"\bsecurity (bug|flaw|issue|exploit|breach)\b",

@@ -43,7 +43,7 @@ class CorpusRetriever:
                         continue
                     self.docs.append({
                         "path":    str(path),
-                        "content": content[:4000],
+                        "content": content[:8000],   # full article for indexing
                         "domain":  domain,
                         "title":   path.stem.replace("-", " ").replace("_", " "),
                     })
@@ -88,7 +88,7 @@ class CorpusRetriever:
             results.append({
                 "domain":  doc["domain"],
                 "title":   doc["title"],
-                "content": doc["content"][:900],
+                "content": doc["content"][:1800],   # more context per doc for Claude
                 "score":   float(scores[idx]),
             })
 
