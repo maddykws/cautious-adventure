@@ -3,9 +3,11 @@ Core triage agent.
 
 Per-ticket pipeline:
   1. Rule-based safety check   → forced escalation if triggered
-  2. Corpus retrieval (TF-IDF) → top-5 relevant docs
-  3. Claude call               → structured JSON response
-  4. Pydantic validation       → TriageResult
+  2. Answerability pre-check   → escalate early if corpus coverage is insufficient
+  3. Corpus retrieval (TF-IDF + reranker) → top-5 relevant chunks
+  4. Multi-intent detection    → extra instruction when ticket has multiple issues
+  5. Claude call               → structured JSON response
+  6. Pydantic validation       → TriageResult
 """
 
 import json
@@ -16,7 +18,7 @@ from typing import Literal
 
 import anthropic
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 # Load .env from repo root — try multiple locations for robustness
 for _env_path in [
@@ -29,7 +31,7 @@ for _env_path in [
         break
 
 sys.path.insert(0, str(Path(__file__).parent))
-from classifier import check_escalation, classify_request_type
+from classifier import check_escalation, classify_request_type, detect_multi_intent
 from retriever import CorpusRetriever
 
 _retriever: CorpusRetriever | None = None
@@ -56,11 +58,13 @@ def get_retriever() -> CorpusRetriever:
 
 
 class TriageResult(BaseModel):
-    status:       Literal["replied", "escalated"]
-    product_area: str
-    response:     str
-    justification: str
-    request_type: Literal["product_issue", "feature_request", "bug", "invalid"]
+    status:           Literal["replied", "escalated"]
+    product_area:     str
+    response:         str
+    justification:    str
+    request_type:     Literal["product_issue", "feature_request", "bug", "invalid"]
+    retrieval_score:  float = 0.0   # top doc TF-IDF score; 0.0 for safety-gate escalations
+    multi_intent:     bool  = False  # True when multiple distinct issues detected
 
 
 _SYSTEM_PROMPT = """\
@@ -87,6 +91,7 @@ off-domain, or only loosely related, prefer escalation over a speculative answer
 
 ESCALATION — set status=escalated ONLY for:
   • Refund demands / billing disputes requiring human payment authorization
+  • Cardholder requests to dispute or contest a charge (corpus only covers merchant side)
   • Requests by non-owners / non-admins to access or modify another user's account
   • Identity theft (personal identity compromised — not lost card which corpus covers)
   • Unauthorized transactions (fraudulent charges — not routine lost/stolen card reports)
@@ -100,6 +105,10 @@ DO NOT escalate:
   • Lost or stolen card / cheque reports — Visa corpus has procedures, reply with them
   • Account management questions (remove user, manage team) — HackerRank corpus covers it
   • General "how do I" product questions — answer from corpus
+
+MULTI-INTENT: when the ticket contains multiple distinct issues, address each one in
+your response. If any sub-issue requires escalation, escalate the whole ticket and
+mention all issues in your justification.
 
 For escalated tickets set response to:
 "This issue requires human review. A support agent will contact you shortly."
@@ -123,7 +132,7 @@ def _model_candidates() -> list[str]:
 
 def _retrieval_quality(company: str, docs: list[dict]) -> str:
     if not docs:
-        return "no_evidence: no matching corpus sections were retrieved; escalate unless the ticket is clearly invalid/out-of-scope."
+        return "no_evidence: no matching corpus sections found; escalate unless clearly invalid."
 
     company_norm = (company or "").strip().lower()
     domain_map = {"hackerrank": "hackerrank", "claude": "claude", "visa": "visa"}
@@ -151,7 +160,42 @@ def _retrieval_quality(company: str, docs: list[dict]) -> str:
     )
 
 
-def _build_user_message(issue: str, subject: str, company: str, docs: list[dict]) -> str:
+def _answerability_check(docs: list[dict], company: str) -> tuple[bool, str]:
+    """
+    Pre-LLM answerability gate — avoids hallucination by escalating early
+    when corpus coverage is clearly insufficient. No extra API call needed.
+    Returns (should_escalate, reason).
+    """
+    if not docs:
+        return True, "No corpus coverage found; escalating to avoid hallucination."
+
+    top_score = docs[0].get("score", 0.0)
+    top_domain = docs[0].get("domain", "")
+    company_norm = (company or "").strip().lower()
+    domain_map = {"hackerrank": "hackerrank", "claude": "claude", "visa": "visa"}
+    expected_domain = domain_map.get(company_norm)
+
+    # Very weak evidence — corpus has almost nothing relevant
+    if top_score < 0.025:
+        return True, f"Corpus coverage too weak (score={top_score:.3f}); escalating."
+
+    # Weak score AND wrong domain — wrong corpus is being used
+    if expected_domain and top_domain != expected_domain and top_score < 0.06:
+        return True, (
+            f"Off-domain weak match (domain={top_domain}, score={top_score:.3f}); "
+            "escalating rather than answering from wrong corpus."
+        )
+
+    return False, ""
+
+
+def _build_user_message(
+    issue: str,
+    subject: str,
+    company: str,
+    docs: list[dict],
+    multi_intent: bool = False,
+) -> str:
     company_label = company if company and company.lower() != "none" else "Unknown (infer from content)"
 
     if docs:
@@ -162,11 +206,18 @@ def _build_user_message(issue: str, subject: str, company: str, docs: list[dict]
     else:
         excerpts = "(No matching corpus articles found. Escalate if uncertain.)"
 
+    multi_note = (
+        "\nMULTI-INTENT DETECTED: This ticket contains multiple distinct issues. "
+        "Address each issue in your response. Escalate the whole ticket if any sub-issue requires it.\n"
+        if multi_intent else ""
+    )
+
     return (
         f"TICKET\n"
         f"Company : {company_label}\n"
         f"Subject : {subject or '(none)'}\n"
-        f"Issue   : {issue}\n\n"
+        f"Issue   : {issue}\n"
+        f"{multi_note}\n"
         f"RETRIEVAL QUALITY\n{_retrieval_quality(company, docs)}\n\n"
         f"CORPUS EXCERPTS\n{excerpts}\n\n"
         f"Classify and respond using ONLY the corpus excerpts above."
@@ -192,6 +243,7 @@ def triage(issue: str, subject: str, company: str) -> TriageResult:
     # ── 1. Rule-based safety gate ─────────────────────────────────────────────
     should_escalate, esc_reason = check_escalation(issue, subject)
     pre_type = classify_request_type(issue, subject)
+    is_multi = detect_multi_intent(issue)
 
     if should_escalate:
         return TriageResult(
@@ -200,6 +252,8 @@ def triage(issue: str, subject: str, company: str) -> TriageResult:
             response="This issue requires human review. A support agent will contact you shortly.",
             justification=f"Safety rule triggered — {esc_reason}. Human review required.",
             request_type=pre_type if pre_type != "invalid" else "product_issue",
+            retrieval_score=0.0,
+            multi_intent=is_multi,
         )
 
     # ── 2. Corpus retrieval ───────────────────────────────────────────────────
@@ -207,8 +261,23 @@ def triage(issue: str, subject: str, company: str) -> TriageResult:
     query = f"{subject} {issue}".strip()[:600]
     docs = retriever.retrieve(query, company=company, top_k=5)
 
-    # ── 3. Claude call ────────────────────────────────────────────────────────
-    user_msg = _build_user_message(issue, subject, company, docs)
+    # ── 3. Answerability pre-check (no extra API call) ────────────────────────
+    should_skip, skip_reason = _answerability_check(docs, company)
+    top_score = docs[0].get("score", 0.0) if docs else 0.0
+
+    if should_skip:
+        return TriageResult(
+            status="escalated",
+            product_area=_fallback_product_area(company, issue),
+            response="This issue requires human review. A support agent will contact you shortly.",
+            justification=skip_reason,
+            request_type=pre_type if pre_type != "invalid" else "product_issue",
+            retrieval_score=top_score,
+            multi_intent=is_multi,
+        )
+
+    # ── 4. Claude call ────────────────────────────────────────────────────────
+    user_msg = _build_user_message(issue, subject, company, docs, multi_intent=is_multi)
     client = _get_client()
 
     for _model in _model_candidates():
@@ -232,6 +301,9 @@ def triage(issue: str, subject: str, company: str) -> TriageResult:
         lines = raw.splitlines()
         raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-    # ── 4. Parse + validate ───────────────────────────────────────────────────
+    # ── 5. Parse + validate ───────────────────────────────────────────────────
     data = json.loads(raw)
-    return TriageResult(**data)
+    result = TriageResult(**data)
+    result.retrieval_score = top_score
+    result.multi_intent = is_multi
+    return result

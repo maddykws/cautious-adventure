@@ -15,6 +15,9 @@ _ESCALATION_PATTERNS = [
     # Unauthorized financial activity (not the same as "my card was lost")
     r"\bunauthorized (charge|transaction|debit|payment)\b",
     r"\bfraudulent (charge|transaction|payment|activity)\b",
+    # Cardholder dispute initiation — corpus covers merchant side only, not cardholder filings
+    r"\bdispute (a |this |the )?(charge|transaction|payment|chargeback)\b",
+    r"\b(file|submit|initiate|raise|open|start) (a |my )?(dispute|chargeback)\b",
     # Security vulnerabilities
     r"\bsecurity vulnerability\b", r"\bbug bounty\b",
     r"\bsecurity (bug|flaw|issue|exploit|breach)\b",
@@ -70,20 +73,30 @@ _BUG_RE = [re.compile(p, re.IGNORECASE) for p in [
 ]]
 
 _INVALID_RE = [re.compile(p, re.IGNORECASE) for p in [
-    r"^(thank you|thanks|thank u|ty)[!.]*\s*$",
-    r"^(hi|hello|hey|good (morning|afternoon|evening))[!.]*\s*$",
-    r"^(hi|hello|hey)[,!\s]*(thanks|thank you|thank u)?[!.]*\s*$",
+    r"^(thank you|thanks|thank u|ty)[!.,\s]*$",
+    r"^(hi|hello|hey|good (morning|afternoon|evening))[!.,\s]*$",
+    r"^(hi|hello|hey)[,!\s]*(there)?[,!\s]*(thanks|thank you|thank u)?[!.,\s]*$",
+    r"^(ok|okay|got it|noted|understood|sure|alright)[!.,\s]*$",
     r"\bwhat is (the name of the actor|the actor in|the name of the movie)\b",
     r"^(none|n/a|na|-)\s*$",
-    r"^give me (the code|a script|code) to\b",  # code requests not related to support
+    r"^give me (the code|a script|code) to\b",
 ]]
+
+# ── Multi-intent detection ────────────────────────────────────────────────────
+
+_MULTI_INTENT_RE = re.compile(
+    r"\b(and also|additionally|furthermore|another (question|issue|problem|thing)|"
+    r"second(ly| question| issue)?|also (i |i'd |i have |i want )|i also (have|want|need)|"
+    r"separately|in addition|besides that|on top of (that|this)|"
+    r"my (other|second|next) (question|issue|concern|problem))\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize_text(text: str) -> str:
     """
     Collapse adversarial formatting before regex safety checks.
-    This catches prompt-injection variants split by newlines, tabs, repeated
-    spaces, or accents (for example French "règles" vs "regles").
+    Strips Unicode combining characters (e.g. accents) so "règles" matches "regles".
     """
     text = " ".join((text or "").split())
     text = unicodedata.normalize("NFKD", text)
@@ -127,3 +140,11 @@ def classify_request_type(issue: str, subject: str = "") -> str:
             return "feature_request"
 
     return "product_issue"
+
+
+def detect_multi_intent(issue: str) -> bool:
+    """
+    Returns True if the ticket appears to contain multiple distinct support intents.
+    Used to signal Claude to address all intents in one response.
+    """
+    return bool(_MULTI_INTENT_RE.search(issue))
