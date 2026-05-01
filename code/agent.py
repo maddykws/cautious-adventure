@@ -36,8 +36,13 @@ for _env_path in [
 sys.path.insert(0, str(Path(__file__).parent))
 from classifier import check_escalation, classify_request_type, detect_multi_intent
 from retriever import CorpusRetriever
-from audit import AuditEntry, EvidenceChunk
+from audit import AuditEntry, EvidenceChunk, ToolCall
 from verifier import check_grounding
+
+# Agent-loop hard caps. The retrieve tool gives the model up to MAX_ITERATIONS
+# extra retrievals before being forced to commit to a final JSON answer.
+MAX_ITERATIONS    = int(os.getenv("AGENT_MAX_ITERATIONS", "4"))
+MAX_TOOL_CALLS    = int(os.getenv("AGENT_MAX_TOOL_CALLS", "6"))
 
 _retriever: CorpusRetriever | None = None
 _client: anthropic.Anthropic | None = None
@@ -82,11 +87,36 @@ class TriageResult(BaseModel):
 _SYSTEM_PROMPT = """\
 You are a support triage agent for three products: HackerRank, Claude, and Visa.
 
-Your ONLY knowledge source is the corpus excerpts supplied in the user message.
-Never use outside knowledge. Never invent policies, steps, phone numbers, or URLs \
-not present in the corpus.
+Your ONLY knowledge source is the support corpus. The user message gives you
+an initial set of corpus excerpts retrieved for this ticket. If those excerpts
+are sufficient to triage the ticket, answer directly — do NOT call any tools.
 
-Return ONLY a JSON object — no markdown fences, no extra text — with exactly these keys:
+If the initial excerpts are NOT sufficient (they don't cover the user's specific
+question, or you need to confirm a policy / find an adjacent procedure / look
+up a related sub-topic), you may use the `retrieve` tool. Each call returns
+up to 5 additional corpus chunks. You have a small budget (≤ 3 follow-up
+retrievals) so use it deliberately.
+
+When NOT to call retrieve:
+  • The initial excerpts already cover the user's question — just answer.
+  • The initial excerpts contain ANY actionable adjacent info (the default
+    behavior, the admin-side procedure, a related setting). Answer with
+    what's there as a partial reply rather than retrieving more — extra
+    retrievals rarely surface sub-page configuration knobs that aren't
+    documented at all, and the model often talks itself into escalation
+    when a partial reply would have been better.
+  • You're tempted to look up something that obviously isn't in the corpus
+    (refund procedures, status pages, dispute filings, score changes,
+    "fill this form for me"). Those are escalations, not retrieve calls.
+  • You're paraphrasing a query you already tried. If the first retrieval
+    didn't surface evidence, a second attempt rarely helps.
+
+When you call retrieve, the tool returns text-only excerpts in the same
+[DOMAIN — Title] format. Use them like the initial excerpts.
+
+When you've gathered enough evidence (or after you've used your budget),
+return ONLY a JSON object — no markdown fences, no extra text, no commentary
+before or after — with exactly these keys:
 {
   "status":        "replied" | "escalated",
   "product_area":  "<most relevant support category, e.g. 'assessments', 'billing', 'card_security'>",
@@ -155,6 +185,13 @@ exact ask can't be fully answered — prefer to REPLY. Examples:
     region-availability check (a common cause), suggest contacting their AWS
     account manager for persistent issues. (Do NOT escalate — region misconfig
     is the most likely cause.)
+  • User asks "what are the inactivity timeouts and can we extend them?"
+    and the corpus describes the default 1-hour interview-end-on-inactivity
+    behavior but has no per-account config knob → REPLY with the default
+    behavior and the relevant Leave-Interview / lobby controls, then note
+    "For changing the specific timeout duration on your account, a support
+    agent can follow up." (Do NOT escalate just because the exact knob
+    isn't documented — describing the default behavior IS the right answer.)
   • User asks "how does X work?" AND demands a refund → REPLY about X,
     note "For the refund a support agent will follow up."
   • User asks about HackerRank security/compliance/infosec posture → REPLY
@@ -171,6 +208,46 @@ For escalated tickets set response to:
 
 For replied tickets, cite only information from the corpus excerpts provided.\
 """
+
+
+# ── Tool schema for the retrieve tool ─────────────────────────────────────────
+
+_RETRIEVE_TOOL_DEF = {
+    "name": "retrieve",
+    "description": (
+        "Search the support corpus for additional evidence chunks. Use this "
+        "ONLY when the initial corpus excerpts in the user message don't cover "
+        "the user's specific question and you need a different angle (e.g. a "
+        "specific policy, a related sub-topic, an adjacent procedure). Each "
+        "call returns up to 5 corpus chunks. You have a budget of at most "
+        "3 follow-up calls — spend them deliberately. Do NOT use this tool to "
+        "look up things obviously absent from the corpus (refund procedures, "
+        "live status pages, dispute filings)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "A focused search query (5-15 words) describing the "
+                    "specific information needed. Use the same vocabulary as "
+                    "support docs, not the user's wording."
+                ),
+            },
+            "company": {
+                "type": "string",
+                "enum": ["HackerRank", "Claude", "Visa"],
+                "description": (
+                    "Which product corpus to focus on. Optional — cross-domain "
+                    "fallback applies automatically when the target corpus has "
+                    "no strong match."
+                ),
+            },
+        },
+        "required": ["query"],
+    },
+}
 
 
 def _model_candidates() -> list[str]:
@@ -549,6 +626,136 @@ def _build_risk_flags(
     return flags
 
 
+# ── Agent loop (tool-use multi-turn) ──────────────────────────────────────────
+
+def _format_chunks_as_excerpts(docs: list[dict]) -> str:
+    """Render a list of corpus chunks the same way the initial user message does,
+    so the model sees a uniform format whether the chunks came from the seed
+    retrieval or a follow-up retrieve() call."""
+    if not docs:
+        return "(No matching corpus articles found for this query.)"
+    return "\n\n---\n\n".join(
+        f"[{d['domain'].upper()} — {d['title']}]\n{d['content']}"
+        for d in docs
+    )
+
+
+def _run_agent_loop(
+    client: anthropic.Anthropic,
+    initial_user_msg: str,
+    seed_docs: list[dict],
+    retriever: CorpusRetriever,
+    seen_keys: set[tuple[str, str]],
+    company: str,
+) -> tuple[dict, list[dict], list[ToolCall]]:
+    """
+    Multi-turn agent loop. The model gets the seed retrieval in the user
+    message and may call `retrieve` up to MAX_ITERATIONS - 1 more times.
+    After each tool call we append the tool_use + tool_result blocks and
+    re-invoke the model. We aggregate ALL retrieved chunks (deduped by
+    (domain, title)) so the verifier sees the full evidence the model used.
+
+    Returns:
+      data         — parsed final JSON object
+      all_evidence — list of every chunk the model saw, in retrieval order
+      tool_calls   — audit log of every retrieve invocation
+
+    Raises RuntimeError if no model variant accepts the request, or if the
+    final response can't be parsed as JSON. Both conditions trigger the
+    main pipeline's escalation fallback in the caller.
+    """
+    messages: list[dict] = [{"role": "user", "content": initial_user_msg}]
+    all_evidence: list[dict] = list(seed_docs)
+    tool_calls: list[ToolCall] = []
+    n_tool_calls = 0
+    last_response = None
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        # On the final iteration we strip tools so the model is forced to
+        # commit to a final JSON answer rather than asking for more.
+        on_final_iter = (iteration == MAX_ITERATIONS) or (n_tool_calls >= MAX_TOOL_CALLS)
+        kwargs: dict = {
+            "max_tokens": 2000,
+            "temperature": 0,
+            "system": _SYSTEM_PROMPT,
+            "messages": messages,
+        }
+        if not on_final_iter:
+            kwargs["tools"] = [_RETRIEVE_TOOL_DEF]
+
+        last_response = None
+        for _model in _model_candidates():
+            try:
+                last_response = client.messages.create(model=_model, **kwargs)
+                break
+            except anthropic.BadRequestError:
+                continue
+        if last_response is None:
+            raise RuntimeError("No valid Claude model accepted the request.")
+
+        # Inspect content blocks. tool_use blocks → another iteration.
+        # text blocks at stop_reason="end_turn" → final answer.
+        tool_use_blocks = [b for b in last_response.content if getattr(b, "type", "") == "tool_use"]
+        text_blocks     = [b for b in last_response.content if getattr(b, "type", "") == "text"]
+
+        if not tool_use_blocks or on_final_iter:
+            # Final answer. Concatenate any text blocks and parse JSON.
+            raw = "\n".join(getattr(b, "text", "") for b in text_blocks).strip()
+            if not raw:
+                raise RuntimeError(
+                    "Agent ended without a text response after tool use."
+                )
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            data = _extract_json_object(raw)
+            return data, all_evidence, tool_calls
+
+        # Append assistant turn (preserving the full content block list so
+        # the API can match tool_use_id on the next request).
+        messages.append({"role": "assistant", "content": last_response.content})
+
+        # Execute every tool call in this turn.
+        tool_result_blocks: list[dict] = []
+        for tu in tool_use_blocks:
+            n_tool_calls += 1
+            args   = getattr(tu, "input", {}) or {}
+            query  = (args.get("query") or "").strip()
+            tool_company = (args.get("company") or company or "").strip()
+            new_docs = retriever.retrieve(query, company=tool_company, top_k=5) if query else []
+
+            n_new = 0
+            for d in new_docs:
+                k = (d["domain"], d["title"])
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    all_evidence.append(d)
+                    n_new += 1
+
+            tool_calls.append(ToolCall(
+                iteration=iteration,
+                query=query[:200],
+                company=tool_company,
+                n_results=len(new_docs),
+                n_new_evidence=n_new,
+            ))
+
+            tool_result_blocks.append({
+                "type":        "tool_result",
+                "tool_use_id": tu.id,
+                "content":     _format_chunks_as_excerpts(new_docs),
+            })
+
+        messages.append({"role": "user", "content": tool_result_blocks})
+
+        if n_tool_calls >= MAX_TOOL_CALLS:
+            # Hit the hard cap mid-iteration; the next loop iteration will
+            # run with on_final_iter=True (no tools) to force a final answer.
+            continue
+
+    raise RuntimeError("Agent loop exited without a final answer.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 def triage_with_audit(
@@ -646,6 +853,7 @@ def triage_with_audit(
             verifier_overall_supported=True,
             verifier_support_ratio=1.0,
             verifier_claims=[],
+            retrieval_mode="hybrid" if retriever.hybrid_available else "tfidf_only",
             status="escalated",
             product_area=result.product_area,
             request_type=result.request_type,
@@ -671,28 +879,63 @@ def triage_with_audit(
             pre_type, is_multi,
         )
 
-    response = None
-    for _model in _model_candidates():
-        try:
-            response = client.messages.create(
-                model=_model,
-                max_tokens=1500,
-                temperature=0,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            break
-        except anthropic.BadRequestError:
-            continue
-    if response is None:
-        raise RuntimeError("No valid Claude model found.")
+    # Run the multi-turn agent loop. The model may call retrieve() up to
+    # MAX_ITERATIONS-1 additional times to gather more corpus evidence.
+    # All retrieved chunks (initial + tool calls) are aggregated for the
+    # verifier and audit trail.
+    seed_keys: set[tuple[str, str]] = {(d["domain"], d["title"]) for d in docs}
+    try:
+        data, all_evidence, tool_calls = _run_agent_loop(
+            client=client,
+            initial_user_msg=user_msg,
+            seed_docs=list(docs),
+            retriever=retriever,
+            seen_keys=seed_keys,
+            company=company,
+        )
+    except (RuntimeError, json.JSONDecodeError, ValueError) as exc:
+        # Agent loop failed — escalate this ticket safely rather than crashing.
+        flags = _build_risk_flags(False, docs, company, is_multi, True, "escalated")
+        flags.append("agent_loop_failed")
+        result = TriageResult(
+            status="escalated",
+            product_area=_fallback_product_area(company, issue),
+            response="This issue requires human review. A support agent will contact you shortly.",
+            justification=f"Agent loop did not return a usable answer ({type(exc).__name__}). Escalated.",
+            request_type=pre_type,
+            retrieval_score=top_score,
+            multi_intent=is_multi,
+        )
+        entry = AuditEntry(
+            ticket_id=ticket_id,
+            issue=issue,
+            subject=subject,
+            company=company,
+            safety_triggered=False,
+            safety_reason="",
+            retrieval_quality=quality,
+            top_score=top_score,
+            domain_match=domain_match,
+            evidence=evidence,
+            answerability_passed=True,
+            answerability_reason="Corpus coverage sufficient.",
+            multi_intent=is_multi,
+            verifier_overall_supported=True,
+            verifier_support_ratio=1.0,
+            verifier_claims=[],
+            tool_calls=[],
+            n_iterations=1,
+            retrieval_mode="hybrid" if retriever.hybrid_available else "tfidf_only",
+            status="escalated",
+            product_area=result.product_area,
+            request_type=result.request_type,
+            risk_flags=flags,
+            confidence_band="escalated",
+            response=result.response,
+            justification=result.justification,
+        )
+        return result, entry
 
-    raw = response.content[0].text.strip()
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-
-    data = _extract_json_object(raw)
     result = TriageResult(**data)
     result.retrieval_score = top_score
     result.multi_intent = is_multi
@@ -703,17 +946,25 @@ def triage_with_audit(
     # Strip any numeric retrieval-score artifacts the model may have echoed
     result.justification = _strip_score_artifacts(result.justification)
 
+    # Build the aggregated evidence list (initial + tool-call results) for
+    # the verifier and the audit trail.
+    aggregated_evidence = [
+        EvidenceChunk(rank=i + 1, domain=d["domain"], title=d["title"], score=d.get("score", 0.0))
+        for i, d in enumerate(all_evidence)
+    ]
+    n_iterations = 1 + len(tool_calls)
+
     # ── 5. Verifier grounding check ───────────────────────────────────────────
     if result.status == "replied":
-        grounding = check_grounding(result.response, docs)
+        grounding = check_grounding(result.response, all_evidence)
         verifier_supported = grounding["overall_supported"]
         verifier_ratio = grounding["support_ratio"]
         verifier_claims = grounding["claims"]
 
         # Downgrade to escalation only on strong disagreement. The verifier is
-        # lexical and produces false negatives on synonym-heavy answers, so we
-        # require a low support ratio (< 0.30) before overriding the LLM's
-        # grounded reply. Tightened from 0.40 to reduce over-escalation.
+        # lexical (with cosine rescue) and produces false negatives on
+        # synonym-heavy answers, so we require a low support ratio (< 0.30)
+        # before overriding a grounded reply.
         if not verifier_supported and verifier_ratio < 0.30:
             result.status = "escalated"
             result.justification += (
@@ -727,6 +978,8 @@ def triage_with_audit(
         verifier_claims = []
 
     flags = _build_risk_flags(False, docs, company, is_multi, verifier_supported, result.status)
+    if tool_calls:
+        flags.append(f"agent_iterations:{n_iterations}")
     band = AuditEntry._band(False, quality, verifier_supported, result.status)
 
     entry = AuditEntry(
@@ -739,13 +992,16 @@ def triage_with_audit(
         retrieval_quality=quality,
         top_score=top_score,
         domain_match=domain_match,
-        evidence=evidence,
+        evidence=aggregated_evidence,
         answerability_passed=True,
         answerability_reason="Corpus coverage sufficient.",
         multi_intent=is_multi,
         verifier_overall_supported=verifier_supported,
         verifier_support_ratio=verifier_ratio,
         verifier_claims=verifier_claims,
+        tool_calls=tool_calls,
+        n_iterations=n_iterations,
+        retrieval_mode="hybrid" if retriever.hybrid_available else "tfidf_only",
         status=result.status,
         product_area=result.product_area,
         request_type=result.request_type,

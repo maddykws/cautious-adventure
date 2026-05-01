@@ -37,6 +37,16 @@ class VerifierClaim:
 
 
 @dataclass
+class ToolCall:
+    """One iteration of the agent's retrieve-tool loop."""
+    iteration: int
+    query: str
+    company: str
+    n_results: int
+    n_new_evidence: int   # new chunks not seen in earlier iterations
+
+
+@dataclass
 class AuditEntry:
     # ── Identity ──────────────────────────────────────────────────────────────
     ticket_id: int
@@ -66,14 +76,19 @@ class AuditEntry:
     verifier_support_ratio: float
     verifier_claims: list[VerifierClaim]
 
+    # ── Agent loop (tool-use iterations) ──────────────────────────────────────
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    n_iterations: int = 1
+    retrieval_mode: str = "n/a"   # "hybrid" | "tfidf_only" | "n/a"
+
     # ── Decision ──────────────────────────────────────────────────────────────
-    status: Literal["replied", "escalated"]
-    product_area: str
-    request_type: str
-    risk_flags: list[str]
-    confidence_band: Literal["high", "medium", "low", "escalated"]
-    response: str
-    justification: str
+    status: Literal["replied", "escalated"] = "escalated"
+    product_area: str = ""
+    request_type: str = ""
+    risk_flags: list[str] = field(default_factory=list)
+    confidence_band: Literal["high", "medium", "low", "escalated"] = "escalated"
+    response: str = ""
+    justification: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

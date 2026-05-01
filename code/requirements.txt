@@ -4,3 +4,9 @@ pydantic~=2.13.0
 python-dotenv~=1.2.0
 rich~=15.0.0
 numpy~=2.4.0
+
+# Optional: dense-embedding hybrid retrieval (offline, no inference API call).
+# The agent gracefully falls back to TF-IDF-only retrieval when these aren't
+# installed, so the requirements stay backward-compatible.
+sentence-transformers>=3.0,<5.0
+torch>=2.0,<3.0
