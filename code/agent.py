@@ -413,13 +413,50 @@ def _build_user_message(
     )
 
 
-def _fallback_product_area(company: str, issue: str) -> str:
-    lo = issue.lower()
-    if "hackerrank" in (company or "").lower() or any(w in lo for w in ("test", "assessment", "candidate", "interview")):
+def _fallback_product_area(company: str, issue: str, subject: str = "") -> str:
+    """Map a safety-gated or fallback-path ticket to a sensible product_area
+    without an LLM call. The previous default-by-company mapping was producing
+    ``account_access`` for Claude security-vulnerability disclosures, which
+    is misleading. Detect the specific safety scenario from the text first,
+    then fall back to a company-level default.
+    """
+    text = (issue + " " + (subject or "")).lower()
+    company_lo = (company or "").lower()
+
+    # Specific scenarios first (each maps to an unambiguous product_area).
+    if any(w in text for w in ("security vulnerability", "bug bounty", "security flaw", "security exploit", "security bug", "security breach")):
+        return "security_disclosure"
+    if any(w in text for w in ("identity theft", "identity stolen", "identity has been stolen", "identity was stolen")):
+        return "fraud_protection"
+    if any(w in text for w in ("unauthorized charge", "unauthorized transaction", "fraudulent charge", "fraudulent transaction")):
+        return "fraud_protection"
+    if any(w in text for w in ("dispute charge", "dispute a charge", "dispute the charge", "chargeback", "dispute this transaction", "dispute a transaction")):
+        return "card_disputes"
+    if any(w in text for w in ("ban the seller", "ban the merchant", "remove the seller", "merchant sent the wrong product", "merchant is ignoring")):
+        return "merchant_disputes"
+    if any(w in text for w in ("increase my score", "graded me unfairly", "tell the company to move me", "modify my score", "change my score", "test score dispute")):
         return "assessments"
-    if "claude" in (company or "").lower():
+    if any(w in text for w in ("none of the submissions", "all requests are failing", "all submissions are failing", "platform is down", "site is down", "stopped working completely", "is down completely")):
+        return "platform_availability"
+    if any(w in text for w in ("delete all files", "rm -rf", "drop table", "ignore previous instructions", "regles internes", "internal rules", "internal prompt", "system prompt")):
+        return "general_support"
+    if any(w in text for w in ("how long", "data retention", "retention period")) and any(w in text for w in ("data", "stored", "retained", "kept")):
+        return "data_privacy"
+    if any(w in text for w in ("infosec", "compliance form", "security questionnaire", "vendor security", "soc 2", "gdpr")):
+        return "security_compliance"
+    # Refund/billing on HackerRank routes to billing
+    if "hackerrank" in company_lo and any(w in text for w in ("refund", "give me my money", "money back", "billing dispute", "payment issue")):
+        return "billing"
+    # Lost / stolen card → travel_support / card_services
+    if "visa" in company_lo and any(w in text for w in ("lost card", "stolen card", "lost visa", "stolen visa", "urgent cash", "emergency cash")):
+        return "card_services"
+
+    # Company-level defaults (used only when no specific scenario matched).
+    if "hackerrank" in company_lo or any(w in text for w in ("hackerrank", "test", "assessment", "candidate", "interview")):
+        return "assessments"
+    if "claude" in company_lo:
         return "account_access"
-    if "visa" in (company or "").lower():
+    if "visa" in company_lo:
         return "card_security"
     return "general_support"
 
@@ -538,6 +575,29 @@ def _support_team_for(company: str) -> str:
     if c == "visa":        return "a Visa support agent"
     if c == "hackerrank":  return "a HackerRank support agent"
     return "a support agent"
+
+
+def _request_type_for_safety(esc_reason: str, pre_type: str) -> str:
+    """Override request_type for adversarial / off-topic safety hits.
+
+    The classifier returns 'product_issue' as the fallback for tickets
+    that don't match _BUG_RE/_FEATURE_RE/_INVALID_RE/_NAV_RE — but if the
+    safety gate fired on an adversarial pattern (delete all files,
+    rm -rf, prompt injection), the right request_type is 'invalid':
+    it's off-topic, not a real product issue.
+    """
+    rl = (esc_reason or "").lower()
+    adversarial_markers = (
+        "delete all files", "rm -rf", "drop table", "exec",
+        "ignore previous instructions", "ignore your instructions",
+        "regles internes", "internal rules", "internal prompt",
+        "system rules", "system prompt", "hidden rules",
+        "documents recuperes", "logique exacte",
+        "what is the actor", "name of the movie", "name of the actor",
+    )
+    if any(m in rl for m in adversarial_markers):
+        return "invalid"
+    return pre_type
 
 
 def _safety_gate_justification(reason: str, company: str) -> str:
@@ -698,7 +758,7 @@ def _deterministic_triage(
 
     result = TriageResult(
         status=status,  # type: ignore[arg-type]
-        product_area=_fallback_product_area(company, issue),
+        product_area=_fallback_product_area(company, issue, subject),
         response=response,
         justification=justification,
         request_type=request_type,  # type: ignore[arg-type]
@@ -913,10 +973,10 @@ def triage_with_audit(
     if should_escalate:
         result = TriageResult(
             status="escalated",
-            product_area=_fallback_product_area(company, issue),
+            product_area=_fallback_product_area(company, issue, subject),
             response="This issue requires human review. A support agent will contact you shortly.",
             justification=_safety_gate_justification(esc_reason, company),
-            request_type=pre_type,
+            request_type=_request_type_for_safety(esc_reason, pre_type),
             retrieval_score=0.0,
             multi_intent=is_multi,
         )
@@ -965,7 +1025,7 @@ def triage_with_audit(
     if should_skip:
         result = TriageResult(
             status="escalated",
-            product_area=_fallback_product_area(company, issue),
+            product_area=_fallback_product_area(company, issue, subject),
             response="This issue requires human review. A support agent will contact you shortly.",
             justification=_answerability_justification(skip_reason, company),
             request_type=pre_type,
@@ -1037,7 +1097,7 @@ def triage_with_audit(
         team = _support_team_for(company)
         result = TriageResult(
             status="escalated",
-            product_area=_fallback_product_area(company, issue),
+            product_area=_fallback_product_area(company, issue, subject),
             response="This issue requires human review. A support agent will contact you shortly.",
             justification=(
                 f"Decision: escalated. "

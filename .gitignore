@@ -31,3 +31,7 @@ data/index/
 data/embeddings/
 *.sqlite
 *.db
+
+# submission artifact (rebuilt before each upload)
+submission_code.zip
+.commit_msg.tmp
