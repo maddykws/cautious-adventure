@@ -9,15 +9,21 @@ support_tickets.csv
        |
   [classifier.py]        — rule-based safety/escalation gate (no API call)
        |
-  [retriever.py]         — section-level TF-IDF search over 774 corpus .md files
+  [PII redaction]        — mask emails / phones / cards / order IDs / tokens
+       |
+  [retriever.py]         — section-level TF-IDF search over the corpus
        |                   RRF reranker + domain boosting + cross-domain fallback
        |
   [answerability check]  — escalate early if corpus coverage is too weak
        |
   [Claude claude-sonnet-4] — structured JSON response grounded in corpus excerpts
+       |                   (graceful corpus-only fallback when no API key)
        |
   [verifier.py]          — Self-RAG-style grounding check: claims vs corpus
-       |                   downgrades to escalation if < 40% of claims supported
+       |                   lexical term-overlap PLUS TF-IDF cosine rescue
+       |
+  [classifier override]  — enforce deterministic request_type on hard signals
+       |                   (bug / feature_request) to prevent LLM downgrades
        |
   output.csv  +  evidence_audit.jsonl
 ```
@@ -28,8 +34,14 @@ support_tickets.csv
 - **Domain boosting** — docs from the ticket's company get a 1.5× relevance boost; other domains get 0.7×. Cross-domain fallback kicks in when the primary domain has no strong match.
 - **Domain synonym expansion** maps user phrasing to documentation terms ("employee left" → "Teams Management", "minimum spend" → "merchant minimum limit").
 - **Rule-based safety gate** runs before any API call. It normalizes whitespace and Unicode accents (NFKD) so multilingual and newline prompt-injection attacks are caught deterministically.
-- **Answerability pre-check** — if retrieval score < 0.025 or weak off-domain match, the ticket is escalated immediately without calling Claude. Prevents hallucination without an extra LLM call.
-- **Verifier grounding check** (Self-RAG style) — after Claude drafts a reply, verifiable claim sentences are extracted and term-matched against the retrieved corpus. If fewer than 60% of claims are supported, the response is downgraded to escalation.
+- **PII redaction** — emails, phone numbers, card numbers, order IDs (`cs_live_…`), SSNs and API tokens are masked before the ticket is sent to the LLM. The local corpus is unchanged; only the outbound API payload is sanitized.
+- **Answerability pre-check** — tickets with retrieval score below 0.018, or off-domain matches under 0.04, are escalated without calling Claude. Tightened from earlier 0.025 / 0.06 thresholds after observing over-escalation on `usable` retrievals.
+- **Verifier grounding check** (Self-RAG style) — after Claude drafts a reply, verifiable claim sentences are extracted and checked two ways: lexical term-overlap (≥ 0.50) OR TF-IDF cosine similarity against the retrieved chunks (≥ 0.18). The cosine signal rescues paraphrased / synonym-heavy answers that pure term overlap misses. Overall reply is downgraded to escalation only on strong disagreement (< 30 %), tightened from 40 % to reduce false-negative escalations.
+- **Classifier-authoritative request_type** — when the rule-based classifier matches a hard pattern (`bug` for "is down" / "not working", `feature_request` for "please add" / "would be nice"), we override the LLM's choice. The LLM still wins on `invalid` (it has full context to judge actionability).
+- **Specific-feature-outage rule** — when a ticket reports a single product feature is "down" / "broken" / "not working" AND the corpus only describes the feature without troubleshooting / status-page / incident-response guidance, the ticket is escalated. Describing a feature is not a substitute for fixing it.
+- **Justification hygiene** — numeric retrieval scores (e.g. "0.174 confidence", "score=0.06") are stripped from LLM-generated justifications so the user-facing field stays qualitative; precise numbers live in the audit trail.
+- **Graceful no-API-key fallback** — if `ANTHROPIC_API_KEY` is missing or the API is unreachable, the agent runs a deterministic classifier + retriever path that quotes the top corpus chunk verbatim (when retrieval is strong on-domain) or escalates. The evaluator still gets a populated CSV row for every ticket.
+- **Robust JSON extraction** — the model is asked for JSON only, but if it appends commentary the parser walks the brace structure (string-literal aware) to recover the first balanced `{…}` object.
 - **Evidence & Safety Audit Trail** — every ticket produces a full `AuditEntry` written to `evidence_audit.jsonl`. Use `--trace` for human-readable Rich output.
 - **Corpus-grounded responses** — Claude is instructed to use only retrieved excerpts and cite the source article. No hallucinated policies.
 - **Fallback escalation** — if Claude's response cannot be parsed or an error occurs, the ticket is escalated (safe default).

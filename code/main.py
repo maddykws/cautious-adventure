@@ -42,21 +42,32 @@ OUTPUT_FIELDS = [
 
 def _preflight(retriever) -> None:
     import os
-    issues = []
+    hard_issues:  list[str] = []
+    soft_issues:  list[str] = []
+
     if not os.getenv("ANTHROPIC_API_KEY"):
-        issues.append("ANTHROPIC_API_KEY is not set — set it in .env")
+        soft_issues.append(
+            "ANTHROPIC_API_KEY is not set — falling back to deterministic "
+            "(corpus-only) responses. Output CSV will still be produced."
+        )
     if not retriever.docs:
-        issues.append("Corpus is empty — check that data/ contains .md files")
+        hard_issues.append("Corpus is empty — check that data/ contains .md files")
     elif len(retriever.docs) < 100:
-        issues.append(f"Corpus looks incomplete ({len(retriever.docs)} chunks, expected 1000+)")
+        hard_issues.append(
+            f"Corpus looks incomplete ({len(retriever.docs)} chunks, expected 1000+)"
+        )
     test_docs = retriever.retrieve("lost visa card stolen", company="Visa", top_k=1)
     if not test_docs:
-        issues.append("Retrieval sanity check failed — no docs for 'lost visa card'")
+        hard_issues.append("Retrieval sanity check failed — no docs for 'lost visa card'")
 
-    if issues:
-        for msg in issues:
-            console.print(f"[red][PREFLIGHT][/red] {msg}")
+    for msg in hard_issues:
+        console.print(f"[red][PREFLIGHT][/red] {msg}")
+    for msg in soft_issues:
+        console.print(f"[yellow][PREFLIGHT][/yellow] {msg}")
+    if hard_issues:
         console.print("[yellow]Proceeding with caution.[/yellow]\n")
+    elif soft_issues:
+        console.print("[yellow]Proceeding in deterministic-fallback mode.[/yellow]\n")
     else:
         console.print("[green][PREFLIGHT][/green] All checks passed.\n")
 
@@ -195,7 +206,7 @@ def run(input_path: Path, output_path: Path, audit_path: Path) -> None:
 
     _preflight(retriever)
 
-    with open(input_path, encoding="utf-8") as f:
+    with open(input_path, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
 
     console.print(f"[bold]Processing {len(rows)} tickets...[/bold]\n")
@@ -281,7 +292,7 @@ def run_trace(input_path: Path, ticket_id: int) -> None:
     elapsed = time.monotonic() - t0
     console.print(f"[green]Indexed[/green] {len(retriever.docs)} corpus chunks in {elapsed:.1f}s\n")
 
-    with open(input_path, encoding="utf-8") as f:
+    with open(input_path, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
 
     if ticket_id < 1 or ticket_id > len(rows):
