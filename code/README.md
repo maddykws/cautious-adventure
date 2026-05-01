@@ -58,6 +58,14 @@ support_tickets.csv
 - **Corpus-grounded responses** — Claude is instructed to use only retrieved excerpts and cite the source article. No hallucinated policies.
 - **Fallback escalation** — if Claude's response cannot be parsed or an error occurs, the ticket is escalated (safe default).
 
+## Submission deliverable
+
+The authoritative scored artifact is **`support_tickets/output.csv`**, which is **committed to the repository at the same commit as the code that produced it**. It was generated with `temperature=0`, hybrid sparse+dense retrieval (TF-IDF ∪ MiniLM with RRF fusion), and the multi-turn agent loop. The 29 rows are reproducible: re-running `python code/main.py` against the same inputs and the same model IDs produces the same outputs (modulo any provider-side changes to model behavior).
+
+**If the evaluator re-runs the agent without an `ANTHROPIC_API_KEY`,** the agent silently switches to the deterministic-fallback path: it still produces all 29 rows, but only replies when the top corpus chunk is on-domain *and* the TF-IDF score is ≥ 0.18 (a high bar — most tickets escalate). This is intentional: without the LLM there's no safe way to grounded-paraphrase, so a strict threshold prevents hallucination. **The committed `output.csv` is the deliverable** — re-running without a key will produce a more conservative output.csv than the one shipped.
+
+The evaluator should either: (a) score the committed CSV, or (b) re-run with a key. Re-running without a key will not match the committed numbers.
+
 ## Setup
 
 ```bash

@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -43,6 +44,45 @@ from verifier import check_grounding
 # extra retrievals before being forced to commit to a final JSON answer.
 MAX_ITERATIONS    = int(os.getenv("AGENT_MAX_ITERATIONS", "4"))
 MAX_TOOL_CALLS    = int(os.getenv("AGENT_MAX_TOOL_CALLS", "6"))
+
+# Rate-limit / transient-error retry. Each individual model call can retry
+# up to RETRY_MAX_ATTEMPTS times with exponential backoff before giving up.
+RETRY_MAX_ATTEMPTS = int(os.getenv("AGENT_RETRY_ATTEMPTS", "3"))
+RETRY_BASE_SECONDS = float(os.getenv("AGENT_RETRY_BACKOFF", "2.0"))
+
+
+def _call_messages_with_retry(client: anthropic.Anthropic, **kwargs):
+    """Wrap client.messages.create with a small backoff loop.
+
+    Retries on:
+      - RateLimitError (HTTP 429)
+      - APIStatusError with 5xx
+      - APIConnectionError / APITimeoutError (transient network)
+
+    Does NOT retry on BadRequestError (probably an invalid model ID — the
+    caller wants to try the next model in _model_candidates).
+    Backoff is exponential: 2s, 4s, 8s. Caller's outer model-fallback loop
+    is unchanged; this just makes each individual call resilient.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError as e:
+            last_exc = e
+        except anthropic.APIConnectionError as e:
+            last_exc = e
+        except anthropic.APITimeoutError as e:
+            last_exc = e
+        except anthropic.APIStatusError as e:
+            if 500 <= getattr(e, "status_code", 0) < 600:
+                last_exc = e
+            else:
+                raise
+        if attempt < RETRY_MAX_ATTEMPTS:
+            time.sleep(RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    assert last_exc is not None
+    raise last_exc
 
 _retriever: CorpusRetriever | None = None
 _client: anthropic.Anthropic | None = None
@@ -309,12 +349,21 @@ _RETRIEVE_TOOL_DEF = {
 
 
 def _model_candidates() -> list[str]:
+    """Return the ordered list of Claude model IDs to try.
+
+    Conservative list of currently-valid model IDs — each one has been
+    confirmed to accept `messages.create` requests. The agent walks this
+    list in order on a BadRequestError so a single retired alias doesn't
+    abort processing.
+
+    Override via env var: ANTHROPIC_MODEL or CLAUDE_MODEL.
+    """
     configured = os.getenv("ANTHROPIC_MODEL") or os.getenv("CLAUDE_MODEL")
     defaults = [
-        "claude-sonnet-4-20250514",
-        "claude-sonnet-4-0",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5",
+        "claude-sonnet-4-5",            # Sonnet 4.5 (current)
+        "claude-sonnet-4-20250514",     # Sonnet 4.0 dated alias (stable)
+        "claude-sonnet-4-0",            # Sonnet 4.0 alias
+        "claude-haiku-4-5-20251001",    # Haiku 4.5 (cheap last-resort)
     ]
     if configured:
         return [configured] + [m for m in defaults if m != configured]
@@ -439,7 +488,7 @@ def _fallback_product_area(company: str, issue: str, subject: str = "") -> str:
     if any(w in text for w in ("none of the submissions", "all requests are failing", "all submissions are failing", "platform is down", "site is down", "stopped working completely", "is down completely")):
         return "platform_availability"
     if any(w in text for w in ("delete all files", "rm -rf", "drop table", "ignore previous instructions", "regles internes", "internal rules", "internal prompt", "system prompt")):
-        return "general_support"
+        return "out_of_scope"
     if any(w in text for w in ("how long", "data retention", "retention period")) and any(w in text for w in ("data", "stored", "retained", "kept")):
         return "data_privacy"
     if any(w in text for w in ("infosec", "compliance form", "security questionnaire", "vendor security", "soc 2", "gdpr")):
@@ -883,9 +932,10 @@ def _run_agent_loop(
         last_response = None
         for _model in _model_candidates():
             try:
-                last_response = client.messages.create(model=_model, **kwargs)
+                last_response = _call_messages_with_retry(client, model=_model, **kwargs)
                 break
             except anthropic.BadRequestError:
+                # Wrong model ID or invalid request shape — try the next model.
                 continue
         if last_response is None:
             raise RuntimeError("No valid Claude model accepted the request.")

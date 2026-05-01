@@ -31,11 +31,26 @@ INPUT_CSV   = REPO_ROOT / "support_tickets" / "support_tickets.csv"
 OUTPUT_CSV  = REPO_ROOT / "support_tickets" / "output.csv"
 AUDIT_JSONL = REPO_ROOT / "support_tickets" / "evidence_audit.jsonl"
 
+# Output column order matches the sample file's Title-Case convention
+# (Issue, Subject, Company, Response, Product Area, Status, Request Type),
+# with Justification appended per problem_statement.md's required-output list.
+# We map our internal lowercase_underscore keys to these display names at
+# write time so the rest of the code stays Pythonic.
 OUTPUT_FIELDS = [
-    "issue", "subject", "company",
-    "response", "product_area", "status", "request_type",
-    "justification",
+    "Issue", "Subject", "Company",
+    "Response", "Product Area", "Status", "Request Type",
+    "Justification",
 ]
+_KEY_TO_DISPLAY = {
+    "issue":         "Issue",
+    "subject":       "Subject",
+    "company":       "Company",
+    "response":      "Response",
+    "product_area":  "Product Area",
+    "status":        "Status",
+    "request_type":  "Request Type",
+    "justification": "Justification",
+}
 
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
@@ -262,9 +277,15 @@ def run(input_path: Path, output_path: Path, audit_path: Path) -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
+        # quoting=QUOTE_ALL ensures multi-line fields (e.g. ticket #25's
+        # multi-line French body, multi-line Subject in the input) survive
+        # round-trip parsing in any CSV reader, including strict ones.
+        writer = csv.DictWriter(
+            f, fieldnames=OUTPUT_FIELDS, quoting=csv.QUOTE_ALL,
+        )
         writer.writeheader()
-        writer.writerows(results)
+        for row in results:
+            writer.writerow({_KEY_TO_DISPLAY[k]: v for k, v in row.items()})
 
     with open(audit_path, "w", encoding="utf-8") as f:
         for entry_dict in audit_entries:

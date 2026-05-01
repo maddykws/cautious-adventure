@@ -217,7 +217,7 @@ def test_output_schema() -> None:
         print("  [SKIP] output.csv not found — run main.py first")
         return
 
-    with open(input_path, encoding="utf-8") as f:
+    with open(input_path, encoding="utf-8-sig") as f:
         input_rows = list(csv.DictReader(f))
     with open(output_path, encoding="utf-8-sig") as f:
         output_rows = list(csv.DictReader(f))
@@ -227,32 +227,36 @@ def test_output_schema() -> None:
         f"Row count mismatch: input={len(input_rows)}, output={len(output_rows)}",
     )
 
-    for i, row in enumerate(output_rows, start=1):
-        assert_true(row.get("status") in {"replied", "escalated"}, f"Row {i}: bad status={row.get('status')!r}")
-        assert_true(
-            row.get("request_type") in {"product_issue", "feature_request", "bug", "invalid"},
-            f"Row {i}: bad request_type={row.get('request_type')!r}",
-        )
-        for field in ("response", "product_area", "justification"):
-            assert_true(bool(row.get(field, "").strip()), f"Row {i}: missing {field}")
+    # Output uses Title-Case column names (matching the sample CSV);
+    # accept both styles for forward-compat if anything ever flips back.
+    def _g(row: dict, *keys: str) -> str:
+        for k in keys:
+            v = row.get(k)
+            if v is not None:
+                return v
+        return ""
 
-        if row.get("status") == "replied":
+    for i, row in enumerate(output_rows, start=1):
+        status   = _g(row, "Status", "status")
+        rtype    = _g(row, "Request Type", "request_type")
+        response = _g(row, "Response", "response")
+        parea    = _g(row, "Product Area", "product_area")
+        just     = _g(row, "Justification", "justification")
+
+        assert_true(status in {"replied", "escalated"}, f"Row {i}: bad status={status!r}")
+        assert_true(
+            rtype in {"product_issue", "feature_request", "bug", "invalid"},
+            f"Row {i}: bad request_type={rtype!r}",
+        )
+        assert_true(bool(response.strip()), f"Row {i}: missing response")
+        assert_true(bool(parea.strip()),    f"Row {i}: missing product_area")
+        assert_true(bool(just.strip()),     f"Row {i}: missing justification")
+
+        if status == "replied":
             assert_true(
-                "Source:" in row.get("response", ""),
+                "Source:" in response,
                 f"Row {i}: replied response missing 'Source:' citation",
             )
-
-        score_str = row.get("retrieval_score", "")
-        if score_str:
-            try:
-                float(score_str)
-            except ValueError:
-                assert_true(False, f"Row {i}: retrieval_score is not a float: {score_str!r}")
-
-        assert_true(
-            row.get("multi_intent", "") in {"true", "false", ""},
-            f"Row {i}: multi_intent should be 'true'/'false', got {row.get('multi_intent')!r}",
-        )
 
 
 # ── Adversarial edge cases (advisory — not hard failures) ────────────────────
