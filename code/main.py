@@ -244,8 +244,6 @@ def run(input_path: Path, output_path: Path, audit_path: Path) -> None:
                     "product_area":    "general_support",
                     "status":          "escalated",
                     "request_type":    "product_issue",
-                    "retrieval_score": "0.000",
-                    "multi_intent":    "false",
                     "justification":   f"Processing error: {str(exc)[:120]}",
                 })
 

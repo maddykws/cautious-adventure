@@ -373,6 +373,7 @@ def triage_with_audit(
             response = client.messages.create(
                 model=_model,
                 max_tokens=1500,
+                temperature=0,
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_msg}],
             )
