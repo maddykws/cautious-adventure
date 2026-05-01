@@ -66,9 +66,20 @@ _FEATURE_RE = [re.compile(p, re.IGNORECASE) for p in [
     r"\bwould it be possible to\b",
 ]]
 
+# Product navigation / discoverability — checked BEFORE bug patterns so a
+# misleading subject ("submissions not working") doesn't override the body
+# ("can't see Apply tab") on what is really a navigation question.
+_NAV_RE = [re.compile(p, re.IGNORECASE) for p in [
+    r"\b(can'?t|cannot|unable to|not able to|can not able to) (see|find|locate|access|view) (the )?\w+ ?(tab|button|menu|option|link|page)\b",
+    r"\b(where (is|do i find|can i find)|how do i (find|access|navigate to)) (the )?\w+ ?(tab|button|menu|option|page|setting)\b",
+    r"\b(apply tab|prepare tab|home tab) (is )?(missing|gone|hidden|not (visible|showing|appearing))\b",
+    r"\b(missing|removed|gone|deprecated|hidden) (apply|prepare|home) tab\b",
+]]
+
 _BUG_RE = [re.compile(p, re.IGNORECASE) for p in [
     r"\b(not working|broken|crash(ing|ed)?|error|bug|glitch|fail(ed|ing)|exception)\b",
     r"\b(doesn'?t work|isn'?t working|stopped working|can'?t (load|access|open|log.?in))\b",
+    r"\b(won'?t|will not) (load|work|open|connect|respond|start|launch)\b",
     r"\b(500|404|502|503)\b",
     r"\b(resume builder is down|is down)\b",
     r"none of the (submissions?|pages?|requests?|challenges?).{0,50}(work|access|load)",
@@ -85,6 +96,32 @@ _INVALID_RE = [re.compile(p, re.IGNORECASE) for p in [
     r"^(none|n/a|na|-)\s*$",
     r"^give me (the code|a script|code) to\b",
 ]]
+
+
+# Words that indicate a generic distress signal without product specifics.
+_VAGUE_DISTRESS_RE = re.compile(
+    r"\b(not working|broken|stopped (working|functioning)?|failing|help|assistance|stuck)\b",
+    re.IGNORECASE,
+)
+# Words that suggest the user gave SOMETHING specific (a product, feature,
+# action, error context) — used to whitelist short messages from the
+# vague-distress check.
+_SPECIFIC_CONTEXT_RE = re.compile(
+    r"\b("
+    r"hackerrank|claude|visa|bedrock|canvas|lti|api|"
+    r"resume|certificate|interview|assessment|test|score|submission|payment|refund|"
+    r"card|cheque|merchant|atm|"
+    r"login|password|account|subscription|plan|admin|owner|teams?|user|employee|"
+    r"tab|menu|button|page|browser|chrome|firefox|safari|"
+    r"crawl|robots|crawler|model|prompt|chat|conversation|"
+    r"compatibility|zoom|connectivity|"
+    r"dispute|fraud|theft|stolen|lost|"
+    r"requests?|challenges?|systems?|sites?|platforms?|services?|"
+    r"\d{2,}|"
+    r"http\S+"
+    r")\b",
+    re.IGNORECASE,
+)
 
 # ── Multi-intent detection ────────────────────────────────────────────────────
 
@@ -125,8 +162,19 @@ def classify_request_type(issue: str, subject: str = "") -> str:
     """
     Keyword-based pre-classification. Claude may override this in its response.
     Returns one of: product_issue | feature_request | bug | invalid
+
+    Order of checks matters:
+      1. Hard 'invalid' patterns (greetings, single-word, off-topic)
+      2. Vague distress with no specific product/feature → invalid
+      3. Navigation / discoverability ("can't see Apply tab") → product_issue
+         (checked BEFORE bug, so a misleading subject like "submissions
+         not working" doesn't override the body's nav question)
+      4. Bug patterns
+      5. Feature-request patterns
+      6. Fallback: product_issue
     """
     text = _normalize_text(f"{subject} {issue}".strip())
+    issue_text = _normalize_text((issue or "").strip())
 
     if not text or len(text) < 8:
         return "invalid"
@@ -134,6 +182,25 @@ def classify_request_type(issue: str, subject: str = "") -> str:
     for regex in _INVALID_RE:
         if regex.search(text):
             return "invalid"
+
+    # Vague-distress invalid: short body + generic distress words + no
+    # specific product/feature/action context. Catches "it's not working,
+    # help" — judged better as invalid than bug because there's nothing
+    # actionable in the ticket itself.
+    if (
+        len(issue_text) <= 40
+        and _VAGUE_DISTRESS_RE.search(issue_text)
+        and not _SPECIFIC_CONTEXT_RE.search(issue_text)
+    ):
+        return "invalid"
+
+    # Navigation/discoverability questions (e.g. "can not see apply tab"):
+    # the bug pattern would otherwise fire on a misleading subject phrase
+    # like "submissions not working" even though the actual issue is a
+    # product change / nav question.
+    for regex in _NAV_RE:
+        if regex.search(issue_text) or regex.search(text):
+            return "product_issue"
 
     for regex in _BUG_RE:
         if regex.search(text):

@@ -105,9 +105,23 @@ def test_request_type_classification() -> None:
     assert_true(classify_request_type("thank you") == "invalid", "thank you should be invalid")
     assert_true(classify_request_type("ok") == "invalid", "single word ok should be invalid")
     assert_true(classify_request_type("all requests are failing") == "bug", "outage wording should be bug")
-    assert_true(classify_request_type("it's not working") == "bug", "not working should be bug")
+    assert_true(
+        classify_request_type("it's not working", "Help needed") == "invalid",
+        "vague 'not working, help' should be invalid (no specific product / feature / context)",
+    )
+    assert_true(classify_request_type("the candidate test page won't load") == "bug",
+                "specific 'page won't load' is still a bug")
     assert_true(classify_request_type("please add a dark mode feature") == "feature_request", "feature request wording")
     assert_true(classify_request_type("how do I pause my subscription") == "product_issue", "product question")
+    # Navigation should beat misleading bug-y subject:
+    assert_true(
+        classify_request_type("i can not able to see apply tab", "I need to practice, submissions not working") == "product_issue",
+        "navigation/discoverability question should be product_issue, not bug, even with misleading subject",
+    )
+    assert_true(
+        classify_request_type("where can I find the certifications tab?") == "product_issue",
+        "where-is-X navigation question should be product_issue",
+    )
 
 
 # ── Multi-intent detection tests ──────────────────────────────────────────────

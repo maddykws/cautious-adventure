@@ -50,13 +50,39 @@ def _extract_key_terms(text: str) -> set[str]:
     return {w.lower() for w in words if w.lower() not in _STOP_WORDS}
 
 
+_GAP_STATEMENT_RE = re.compile(
+    r"\b("
+    r"corpus (does(n'?t| not)|provides? no|contains? no|has(n'?t| not| no))"
+    r"|the (documentation|corpus|article|excerpt) (does(n'?t| not)|provides? no|contains? no)"
+    r"|(no|not) (information|specific(s|ation)?|coverage|guidance|details?|procedure) (about|on|for|regarding)"
+    r"|isn'?t (covered|documented|specified|in the corpus)"
+    r"|don'?t (have|cover|specify|address)"
+    r"|cannot (find|locate) (this|that|specific)"
+    r"|outside (the )?(scope|coverage)"
+    r"|for (specific|the specific) .{0,40}(a support agent|please contact|will follow up|will be in touch)"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _is_verifiable(line: str) -> bool:
-    """Filter out lines that are not worth checking (headers, citations, empty)."""
+    """Filter out lines that aren't worth grounding-checking.
+
+    Skips:
+      • Headings, citation lines, very short fragments
+      • Gap statements ("the corpus doesn't specify X", "no information on Y",
+        "for the specific timeout, a support agent will follow up") — these
+        are meta-statements about corpus coverage, not corpus-grounded claims;
+        running term-overlap on them produces false negatives because the
+        terms ARE the user's specifics, which by definition aren't in the
+        corpus. The partial-reply pattern depends on this filter.
+    """
     stripped = line.strip()
     if len(stripped) < 25:
         return False
-    # Skip citation lines and markdown headings
     if stripped.startswith("Source:") or stripped.startswith("#"):
+        return False
+    if _GAP_STATEMENT_RE.search(stripped):
         return False
     # Keep: step instructions, bold items, substantive sentences
     return (
